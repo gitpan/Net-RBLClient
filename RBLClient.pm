@@ -6,12 +6,13 @@ use Net::DNS::Packet;
 
 use vars qw( $VERSION $ip_pat );
 $ip_pat = qr(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3});
-$VERSION = '0.1';
+$VERSION = '0.2';
 
 sub new {
     my($class, %args) = @_;
     my $self = {
         lists       => [ lists() ],
+        query_txt   => 0,
         max_time    => 8,
         timeout     => 1,
         max_hits    => 1000,
@@ -26,15 +27,16 @@ sub new {
         $self->{ $key } = $args{ $key }; 
     }
     if($self->{ server } eq 'resolv.conf') {
+        local *F;
         open F, '/etc/resolv.conf'
             or die "Can't open resolv.conf: $!";
         local $/;
         my $resolv = <F>;
-        if($resolv =~ /^nameserver\s+($ip_pat)/) {
+        if($resolv =~ /^nameserver\s+($ip_pat)/m) {
             $self->{ server } = $1;
         }
         else {
-            die "No nameserver found in resolv.conf: specify on in constructor";
+            die "No nameserver found in resolv.conf; specify one in constructor";
         }
     }
     $self;
@@ -54,35 +56,51 @@ sub lookup {
         PeerAddr  => $self->{ server },
     ) or die "Failed to create UDP client";
 
-    foreach my $list(@{ $self->{ lists } }) {
-        my $msg = mk_packet($qip, $list);
-        $sock->send($msg) || die "send: $!";
+    if ( $self->{ query_txt } ) {
+        foreach my $list(@{ $self->{ lists } }) {
+            my($msg_a, $msg_t) = mk_packet($qip, $list);
+            foreach ($msg_a, $msg_t) { $sock->send($_) or die "send: $!" }
+        }
+    }
+    else {
+        foreach my $list(@{ $self->{ lists } }) {
+            my $msg = mk_packet($qip, $list);
+            $sock->send($msg) || die "send: $!";
+        }
     }
     my $dur = time - $start_time;
+
+    $self->{ results } = {};
+    $self->{ txt } = {};
 
     # Keep recv'ing packets until one of the exit conditions is met:
 
     my $needed = @{ $self->{ lists } }; # how many packets needed back
-    my $hits;
-    my $replies;
+    $needed <<= 1 if $self->{ query_txt };
+    my $hits = my $replies = 0;
 
     while($needed && time < $deadline) {
         my $msg = '';
         eval {
-            $SIG{ALRM} = sub { die "alarm time out" };
+            local $SIG{ ALRM } = sub { die "alarm time out" };
             alarm $self->{ timeout };
             $sock->recv($msg, $self->{ udp_maxlen })  || die "recv: $!";
             alarm 0;
             1; # eval was OK
         };
         if($msg) {
-            my ($domain, $res) = decode_packet($msg);
-            $replies ++;
-            $hits ++ if $res;
-            $self->{ results }{ $domain } = $res if $res;
+            my ($domain, $res, $type) = decode_packet($msg);
+            if ( defined $type && $type eq 'TXT' ) {
+                $self->{ txt }{ $domain } = $res
+            }
+            elsif ($res) {
+                $replies ++;
+                $hits ++ if $res;
+                $self->{ results }{ $domain } = $res;
+                return 1 if    $hits >= $self->{ max_hits } ||
+                            $replies >= $self->{ max_replies };
+            }
             $needed --;
-            return 1 if $hits >= $self->{ max_hits };
-            return 1 if $replies >= $self->{ max_replies };
         }
     }
     1;
@@ -98,13 +116,26 @@ sub listed_hash {
     %{ $self->{ results } };
 }
 
+sub txt_hash {
+    my $self = shift;
+    warn <<_ unless $self->{ query_txt };
+Without query_txt turned on, you won't get any results from ->txt_hash().
+_
+    if (wantarray) { %{ $self->{ txt } } }
+    else { $self->{ txt } }
+}
+
 # End methods - begin internal functions
 
 sub mk_packet {
     # pass me a REVERSED dotted quad ip (qip) and a blocklist domain
     my($qip, $list) = @_;
-    my $packet = Net::DNS::Packet->new("$qip.$list", 'A', 'IN');
-    $packet->data;
+    my($packet, $error) = new Net::DNS::Packet my $fqdn = "$qip.$list", 'A';
+    die "Cannot build DNS query for $fqdn, type A: $error" unless $packet;
+    return $packet->data unless wantarray;
+    (my $txt_packet, $error) = new Net::DNS::Packet $fqdn, 'TXT', 'IN';
+    die "Cannot build DNS query for $fqdn, type TXT: $error" unless $txt_packet;
+    $packet->data, $txt_packet->data;
 }
 
 sub decode_packet {
@@ -113,18 +144,27 @@ sub decode_packet {
     my $data = shift;
     my $packet = Net::DNS::Packet->new(\$data);
     my @answer = $packet->answer;
-    
-    foreach my $answer(@answer) {
-        my $domain = $answer->name;
-        $domain =~ s/^\d+\.\d+\.\d+\.\d+\.//;
-        my $res = '?';
-        if($answer->type eq 'A') {
-            $res = inet_ntoa($answer->rdata);
+
+    {
+        my($res, $domain, $type);
+        foreach my $answer (@answer) {
+            {
+                my $name = lc $answer->name;
+                warn $answer->answerfrom .
+                  " returned answers to different domains ($domain and $answer)"
+                  if defined $domain && $name ne $domain;
+                $domain = $answer->name;
+            }
+            $domain =~ s/^\d+\.\d+\.\d+\.\d+\.//;
+            $type = $answer->type;
+            $res = $type eq 'A'     ? inet_ntoa($answer->rdata)  :
+                   $type eq 'CNAME' ?   cleanup($answer->rdata)  :
+                   $type eq 'TXT'   ? (defined $res && "$res; ")
+                                      . $answer->txtdata         :
+                   '?';
+            last unless $type eq 'TXT';
         }
-        elsif($answer->type eq 'CNAME') {
-            $res = cleanup($answer->rdata);
-        }
-        return($domain, $res);
+        return $domain, $res, $type if defined $res;
     }
     
     # OK, there were no answers -
@@ -141,49 +181,57 @@ sub decode_packet {
 
 sub cleanup {
     # remove control chars and stuff
-    $_[ 0 ] =~ tr/a-zA-Z0-9./ /cs;
+    $_[ 0 ] =~ tr/a-zA-Z0-9./ /cs;;
     $_[ 0 ];
 }
+
+# lists removed due to osirusoft outage:
+
+        # spews.relays.osirusoft.com
+        # spamsites.relays.osirusoft.com
+        # spamhaus.relays.osirusoft.com
+        # socks.relays.osirusoft.com
+        # relays.osirusoft.com
+        # proxy.relays.osirusoft.com
+        # inputs.relays.osirusoft.com
+        # dialups.relays.osirusoft.com
+        # blocktest.relays.osirusoft.com
 
 sub lists {
     qw(
         blackhole.compu.net
-        blackholes.2mbit.com
         blackholes.brainerd.net
         blackholes.five-ten-sg.com
         blackholes.intersil.net
         blackholes.wirehub.net
         block.blars.org
-        blocktest.relays.osirusoft.com
         bl.reynolds.net.au
         bl.spamcop.net
         dev.null.dk
-        dews.qmail.org
-        dialups.relays.osirusoft.com
         dnsbl.njabl.org
         dynablock.wirehub.net
         flowgoaway.com
         formmail.relays.monkeys.com
         http.opm.blitzed.org
-        inputs.relays.osirusoft.com
+        inputs.orbz.org
+        list.dsbl.org
+        multihop.dsbl.org
+        opm.blitzed.org
         korea.services.net
         orbs.dorkslayers.com
+        outputs.orbz.org
         pm0-no-more.compu.net
         proxies.monkeys.com
         proxies.relays.monkeys.com
-        proxy.relays.osirusoft.com
         relays.dorkslayers.com
         relays.ordb.org
-        relays.osirusoft.com
         relays.visi.com
         socks.opm.blitzed.org
-        socks.relays.osirusoft.com
+        spews.bl.reynolds.net.au
         spamguard.leadmon.net
-        spamhaus.relays.osirusoft.com
         spammers.v6net.org
-        spamsites.relays.osirusoft.com
+        unconfirmed.dsbl.org
         spamsources.fabel.dk
-        spews.relays.osirusoft.com
         work.drbl.croco.net
         xbl.selwerd.cx
         ztl.dorkslayers.com
@@ -232,6 +280,13 @@ An arraref of (sub)domains representing RBLs.  In other words, each element
 in the array is a string similar to 'relays.somerbl.org'.  Use this if
 you want to query a specific list of RBL's - if this argument is omitted,
 a large list of RBL's is queried.
+
+=item query_txt
+
+Set this to true if you want Net::RBLClient to also query for TXT records,
+in which many RBL's store additional information about the reason for
+including an IP address or links to pages that contain such information.
+You can then retrieve these information using the L</txt_hash()> method.
 
 =item max_time
 
@@ -302,11 +357,25 @@ typically 127.0.0.1 - 127.0.0.4.  If the RBL returned a CNAME, the
 value will be the hostname, typically used for a comment on why the
 IP address is listed.
 
+=item txt_hash()
+
+Return a hash (or a reference to that hash if called in a scalar
+context) whose keys are the RBL's which block the specified IP,
+represented as in C<listed_by()>.  If the RBL returned TXT records
+containing additional information, the value will contain this
+information (several TXT records from one RBL will be joined by
+semicolons, but this should not happen), if not, it will be
+L<undef|perlfunc/undef>.
+
 =back
 
 =head1 AUTHOR
 
 Asher Blum E<lt>F<asher@wildspark.com>E<gt>
+
+=head1 CREDITS
+
+Martin H. Sluka E<lt>F<martin@sluka.de>E<gt>
 
 =head1 COPYRIGHT
 

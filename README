@@ -7,5 +7,3 @@ perl Makefile.PL
 make
 make install
 
-asher@wildspark.com
-
