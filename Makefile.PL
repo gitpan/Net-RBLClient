@@ -8,6 +8,7 @@ WriteMakefile(
         Time::HiRes      => 0,
         Net::DNS::Packet => 0,
     },
+    EXE_FILES => [ qw( spamalyze ) ],
 
    ($] >= 5.005 ?
         ('AUTHOR'               => 'Asher Blum <asher@wildspark.com>',

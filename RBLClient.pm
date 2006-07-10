@@ -6,7 +6,7 @@ use Net::DNS::Packet;
 
 use vars qw( $VERSION $ip_pat );
 $ip_pat = qr(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3});
-$VERSION = '0.2';
+$VERSION = '0.4';
 
 sub new {
     my($class, %args) = @_;
@@ -149,11 +149,13 @@ sub decode_packet {
         my($res, $domain, $type);
         foreach my $answer (@answer) {
             {
+                # removed $answer->answerfrom because it caused an error
+                # with some types of answers
+
                 my $name = lc $answer->name;
-                warn $answer->answerfrom .
-                  " returned answers to different domains ($domain and $answer)"
+                warn "Packet contained answers to different domains ($domain != $name)"
                   if defined $domain && $name ne $domain;
-                $domain = $answer->name;
+                $domain = $name;
             }
             $domain =~ s/^\d+\.\d+\.\d+\.\d+\.//;
             $type = $answer->type;
@@ -199,41 +201,51 @@ sub cleanup {
 
 sub lists {
     qw(
+        badconf.rhsbl.sorbs.net
+        bl.reynolds.net.au
+        bl.spamcop.net
         blackhole.compu.net
         blackholes.brainerd.net
         blackholes.five-ten-sg.com
         blackholes.intersil.net
         blackholes.wirehub.net
         block.blars.org
-        bl.reynolds.net.au
-        bl.spamcop.net
+        block.dnsbl.sorbs.net
         dev.null.dk
         dnsbl.njabl.org
+        dul.dnsbl.sorbs.net
         dynablock.wirehub.net
         flowgoaway.com
         formmail.relays.monkeys.com
+        http.dnsbl.sorbs.net
         http.opm.blitzed.org
-        inputs.orbz.org
-        list.dsbl.org
-        multihop.dsbl.org
-        opm.blitzed.org
         korea.services.net
+        list.dsbl.org
+        misc.dnsbl.sorbs.net
+        multihop.dsbl.org
+        no-more-funn.moensted.dk
+        nomail.rhsbl.sorbs.net
+        opm.blitzed.org
         orbs.dorkslayers.com
-        outputs.orbz.org
         pm0-no-more.compu.net
         proxies.monkeys.com
         proxies.relays.monkeys.com
+        psbl.surriel.com
         relays.dorkslayers.com
         relays.ordb.org
         relays.visi.com
+        smtp.dnsbl.sorbs.net
+        socks.dnsbl.sorbs.net
         socks.opm.blitzed.org
-        spews.bl.reynolds.net.au
+        spam.dnsbl.sorbs.net
         spamguard.leadmon.net
         spammers.v6net.org
-        unconfirmed.dsbl.org
         spamsources.fabel.dk
+        spews.bl.reynolds.net.au
+        unconfirmed.dsbl.org
+        web.dnsbl.sorbs.net
         work.drbl.croco.net
-        xbl.selwerd.cx
+        zombie.dnsbl.sorbs.net
         ztl.dorkslayers.com
     );
 }
